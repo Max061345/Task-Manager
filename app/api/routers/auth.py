@@ -3,7 +3,7 @@ from fastapi.security import OAuth2PasswordRequestForm
 from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.api.deps import get_current_user, get_async_session
+from app.api.deps import get_async_session, get_current_user
 from app.core.security import create_access_token, get_password_hash, verify_password
 from app.models.user import User
 from app.schemas.user import Token, UserLogin, UserRead, UserRegister
@@ -16,7 +16,7 @@ async def register(
     user_in: UserRegister,
     session: AsyncSession = Depends(get_async_session),
 ) -> User:
-    # Перевірка на існування користувача з таким email або username
+    """Register a new user account."""
     stmt = select(User).where(or_(User.email == user_in.email, User.username == user_in.username))
     result = await session.execute(stmt)
     existing_user = result.scalar_one_or_none()
@@ -24,7 +24,7 @@ async def register(
     if existing_user:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Користувач із таким email або username вже зареєстрований",
+            detail="User with this email or username is already registered.",
         )
 
     db_user = User(
@@ -43,6 +43,7 @@ async def login_json(
     credentials: UserLogin,
     session: AsyncSession = Depends(get_async_session),
 ) -> Token:
+    """Authenticate user with JSON payload and return JWT bearer token."""
     stmt = select(User).where(
         or_(
             User.email == credentials.username_or_email,
@@ -55,7 +56,7 @@ async def login_json(
     if not user or not verify_password(credentials.password, user.hashed_password):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Невірні облікові дані",
+            detail="Invalid credentials.",
             headers={"WWW-Authenticate": "Bearer"},
         )
 
@@ -68,7 +69,7 @@ async def login_form(
     form_data: OAuth2PasswordRequestForm = Depends(),
     session: AsyncSession = Depends(get_async_session),
 ) -> Token:
-    """Для Swagger UI авторизації через кнопку Authorize."""
+    """OAuth2 password form login endpoint for Swagger UI authorization."""
     stmt = select(User).where(
         or_(
             User.email == form_data.username,
@@ -81,7 +82,7 @@ async def login_form(
     if not user or not verify_password(form_data.password, user.hashed_password):
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Невірні облікові дані",
+            detail="Invalid credentials.",
             headers={"WWW-Authenticate": "Bearer"},
         )
 
@@ -93,4 +94,5 @@ async def login_form(
 async def read_users_me(
     current_user: User = Depends(get_current_user),
 ) -> User:
+    """Get current authenticated user information."""
     return current_user

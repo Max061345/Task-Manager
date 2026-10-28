@@ -1,4 +1,3 @@
-from collections.abc import AsyncGenerator
 import jwt
 from fastapi import Depends, HTTPException, status
 from fastapi.security import OAuth2PasswordBearer
@@ -17,9 +16,10 @@ async def get_current_user(
     session: AsyncSession = Depends(get_async_session),
     token: str = Depends(reusable_oauth2),
 ) -> User:
+    """Extract and validate user from JWT bearer token."""
     credentials_exception = HTTPException(
         status_code=status.HTTP_401_UNAUTHORIZED,
-        detail="Unable to verify credentials",
+        detail="Could not validate credentials.",
         headers={"WWW-Authenticate": "Bearer"},
     )
     try:
