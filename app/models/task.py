@@ -49,3 +49,11 @@ class Task(Base):
     # Relationships
     creator = relationship("User", foreign_keys=[creator_id], lazy="selectin")
     assignee = relationship("User", foreign_keys=[assignee_id], lazy="selectin")
+
+
+    comments = relationship(
+    "Comment",
+    back_populates="task",
+    cascade="all, delete-orphan",
+    lazy="selectin",
+)

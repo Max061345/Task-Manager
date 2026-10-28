@@ -1,9 +1,13 @@
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
 
-from app.api.routers import auth, tasks
+from app.api.routers import auth, comments, tasks
 from app.core.database import engine
 from app.models.base import Base
+# Import all models so Base metadata detects them for table creation
+import app.models.comment
+import app.models.task
+import app.models.user
 
 
 @asynccontextmanager
@@ -23,6 +27,7 @@ app = FastAPI(
 
 app.include_router(auth.router, prefix="/api/v1")
 app.include_router(tasks.router, prefix="/api/v1")
+app.include_router(comments.router, prefix="/api/v1")
 
 
 @app.get("/health", tags=["Health"])
