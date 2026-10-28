@@ -8,14 +8,20 @@ from app.models.enums import TaskStatus
 from app.models.task import Task
 from app.models.user import User
 
-# Active statuses according to business rules (Backlog, In Progress, Review)
+# Active statuses according to specification (Backlog, In Progress, Review)
 ACTIVE_STATUSES: Set[TaskStatus] = {
     TaskStatus.BACKLOG,
     TaskStatus.IN_PROGRESS,
     TaskStatus.REVIEW,
 }
 
-# Explicitly allowed forward transitions
+# Terminal statuses where modification is disallowed
+TERMINAL_STATUSES: Set[TaskStatus] = {
+    TaskStatus.DONE,
+    TaskStatus.CANCELLED,
+}
+
+# Permitted state transitions (moving back is strictly prohibited)
 ALLOWED_TRANSITIONS: dict[TaskStatus, set[TaskStatus]] = {
     TaskStatus.BACKLOG: {TaskStatus.IN_PROGRESS, TaskStatus.CANCELLED},
     TaskStatus.IN_PROGRESS: {TaskStatus.REVIEW, TaskStatus.CANCELLED},
@@ -24,13 +30,18 @@ ALLOWED_TRANSITIONS: dict[TaskStatus, set[TaskStatus]] = {
     TaskStatus.CANCELLED: set(),
 }
 
+MAX_ACTIVE_TASKS_PER_USER: int = 10
+
 
 async def ensure_user_exists(session: AsyncSession, user_id: int) -> User:
-    """Verify that a user with the given ID exists in the database."""
+    """Validate that the specified user exists in the database.
+
+    Raises:
+        HTTPException: 404 NOT FOUND if user does not exist.
+    """
     stmt = select(User).where(User.id == user_id)
     result = await session.execute(stmt)
     user = result.scalar_one_or_none()
-
     if not user:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -44,7 +55,14 @@ async def check_active_task_limit(
     assignee_id: int,
     exclude_task_id: Optional[int] = None,
 ) -> None:
-    """Ensure an assignee does not exceed the limit of 10 active tasks."""
+    """Ensure an assignee does not exceed the limit of 10 active tasks.
+
+    Active tasks include: Backlog, In Progress, Review.
+    Maximum allowed active tasks per user: 10.
+
+    Raises:
+        HTTPException: 400 BAD REQUEST if the user has 10 or more active tasks.
+    """
     query = (
         select(func.count())
         .select_from(Task)
@@ -53,19 +71,85 @@ async def check_active_task_limit(
             Task.status.in_(ACTIVE_STATUSES),
         )
     )
-
     if exclude_task_id is not None:
         query = query.where(Task.id != exclude_task_id)
 
     count_result = await session.execute(query)
     active_count = count_result.scalar_one()
 
-    if active_count >= 10:
+    if active_count >= MAX_ACTIVE_TASKS_PER_USER:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=(
                 f"User with ID {assignee_id} already has {active_count} active tasks. "
-                "A user cannot have more than 10 active tasks simultaneously."
+                f"A user cannot have more than {MAX_ACTIVE_TASKS_PER_USER} active tasks simultaneously."
+            ),
+        )
+
+
+# Backward-compatible alias
+validate_active_task_capacity = check_active_task_limit
+
+
+def validate_deadline_not_past(deadline: datetime) -> None:
+    """Validate that the deadline is not earlier than the current UTC time.
+
+    Raises:
+        HTTPException: 400 BAD REQUEST if deadline is in the past.
+    """
+    current_time = datetime.now(timezone.utc)
+    target_time = deadline if deadline.tzinfo else deadline.replace(tzinfo=timezone.utc)
+    if target_time < current_time:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="Deadline cannot be earlier than the current date and time.",
+        )
+
+
+def validate_task_editable(task: Task) -> None:
+    """Check if task can be edited. Tasks in Done and Cancelled cannot be edited.
+
+    Raises:
+        HTTPException: 400 BAD REQUEST if task is in terminal status.
+    """
+    if task.status in TERMINAL_STATUSES:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Tasks in status '{task.status.value}' cannot be edited.",
+        )
+
+
+def validate_assignee_change(task: Task, new_assignee_id: Optional[int]) -> None:
+    """Validate assignee changes.
+
+    Assignee cannot be changed if the task is in Review or Done status.
+
+    Raises:
+        HTTPException: 400 BAD REQUEST if task is in Review or Done.
+    """
+    if new_assignee_id != task.assignee_id:
+        if task.status in {TaskStatus.REVIEW, TaskStatus.DONE}:
+            raise HTTPException(
+                status_code=status.HTTP_400_BAD_REQUEST,
+                detail=f"Assignee cannot be changed when task is in '{task.status.value}' status.",
+            )
+
+
+def validate_task_deletable(task: Task) -> None:
+    """Validate if task can be deleted.
+
+    A task cannot be deleted if it is in 'In Progress' or 'Review' status.
+    It must be transitioned to 'Cancelled' or 'Done' before deletion.
+
+    Raises:
+        HTTPException: 400 BAD REQUEST if task is in progress or review.
+    """
+    if task.status in {TaskStatus.IN_PROGRESS, TaskStatus.REVIEW}:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=(
+                f"Task in status '{task.status.value}' cannot be deleted. "
+                "Move the task to 'Cancelled' or 'Done' before deleting."
             ),
         )
 
@@ -73,11 +157,16 @@ async def check_active_task_limit(
 def validate_status_transition(task: Task, new_status: TaskStatus) -> None:
     """Validate status transition rules according to domain specifications.
 
-    Rules enforced:
-      1. Moving back to a previous status is forbidden.
-      2. Done and Cancelled are terminal states (no transitions allowed).
-      3. Only predefined transitions are allowed.
-      4. Transition to 'Done' requires an assigned user and a valid (non-expired) deadline.
+    Rules:
+      1. Same status transition is rejected.
+      2. Terminal states (Done, Cancelled) cannot transition to any other status.
+      3. Returning to a previous status returns an error.
+      4. Only predefined forward transitions are permitted.
+      5. Transition to 'Done' requires an assigned user.
+      6. Transition to 'Done' requires a valid (non-expired) deadline.
+
+    Raises:
+        HTTPException: 400 BAD REQUEST if any transition rule is violated.
     """
     if task.status == new_status:
         raise HTTPException(
@@ -85,14 +174,12 @@ def validate_status_transition(task: Task, new_status: TaskStatus) -> None:
             detail=f"Task is already in '{new_status.value}' status.",
         )
 
-    # Disallow transitions from terminal states
-    if task.status in {TaskStatus.DONE, TaskStatus.CANCELLED}:
+    if task.status in TERMINAL_STATUSES:
         raise HTTPException(
             status_code=status.HTTP_400_BAD_REQUEST,
             detail=f"Cannot change status from terminal state '{task.status.value}'.",
         )
 
-    # Check if transition is in the allowed transition map
     allowed = ALLOWED_TRANSITIONS.get(task.status, set())
     if new_status not in allowed:
         raise HTTPException(
@@ -103,7 +190,6 @@ def validate_status_transition(task: Task, new_status: TaskStatus) -> None:
             ),
         )
 
-    # Specific business rules for transitioning to 'Done'
     if new_status == TaskStatus.DONE:
         if task.assignee_id is None:
             raise HTTPException(
@@ -112,10 +198,8 @@ def validate_status_transition(task: Task, new_status: TaskStatus) -> None:
             )
 
         now_utc = datetime.now(timezone.utc)
-        task_deadline = (
-            task.deadline if task.deadline.tzinfo else task.deadline.replace(tzinfo=timezone.utc)
-        )
-        if task_deadline < now_utc:
+        deadline = task.deadline if task.deadline.tzinfo else task.deadline.replace(tzinfo=timezone.utc)
+        if deadline < now_utc:
             raise HTTPException(
                 status_code=status.HTTP_400_BAD_REQUEST,
                 detail="Task cannot be marked as 'Done' because its deadline has already expired.",

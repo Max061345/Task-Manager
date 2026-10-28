@@ -7,9 +7,16 @@ from app.api.deps import get_current_user, get_async_session
 from app.models.enums import TaskStatus
 from app.models.task import Task
 from app.models.user import User
-from app.schemas.task import TaskCreate, TaskRead, TaskUpdate, TaskStatusUpdate
-from app.services.task_service import check_active_task_limit, ensure_user_exists, validate_status_transition
-
+from app.schemas.task import TaskCreate, TaskRead, TaskStatusUpdate, TaskUpdate
+from app.services.task_service import (
+    check_active_task_limit,
+    ensure_user_exists,
+    validate_assignee_change,
+    validate_deadline_not_past,
+    validate_status_transition,
+    validate_task_deletable,
+    validate_task_editable,
+)
 
 router = APIRouter(prefix="/tasks", tags=["Tasks"])
 
@@ -20,11 +27,11 @@ async def create_task(
     current_user: User = Depends(get_current_user),
     session: AsyncSession = Depends(get_async_session),
 ) -> Task:
-    """Create a new task with initial 'Backlog' status."""
-    # Verify assignee if provided
+    """Create a new task in Backlog status with full business rule validation."""
+    validate_deadline_not_past(task_in.deadline)
+
     if task_in.assignee_id is not None:
         await ensure_user_exists(session, task_in.assignee_id)
-        # Check active task capacity
         await check_active_task_limit(session, task_in.assignee_id)
 
     new_task = Task(
@@ -81,7 +88,7 @@ async def update_task(
     session: AsyncSession = Depends(get_async_session),
     _: User = Depends(get_current_user),
 ) -> Task:
-    """Update task details with business constraint checks."""
+    """Update task fields while enforcing business constraints."""
     stmt = select(Task).where(Task.id == task_id)
     result = await session.execute(stmt)
     task = result.scalar_one_or_none()
@@ -92,31 +99,53 @@ async def update_task(
             detail=f"Task with ID {task_id} not found.",
         )
 
-    # Rule: Tasks in Done or Cancelled status cannot be edited
-    if task.status in {TaskStatus.DONE, TaskStatus.CANCELLED}:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=f"Task in status '{task.status.value}' cannot be modified.",
-        )
+    # 1. Tasks in Done and Cancelled status cannot be edited
+    validate_task_editable(task)
 
     update_data = task_update.model_dump(exclude_unset=True)
 
-    # Rule: Once in Review or Done, assignee cannot be changed
-    if "assignee_id" in update_data and update_data["assignee_id"] != task.assignee_id:
-        if task.status in {TaskStatus.REVIEW, TaskStatus.DONE}:
-            raise HTTPException(
-                status_code=status.HTTP_400_BAD_REQUEST,
-                detail=f"Assignee cannot be modified when task status is '{task.status.value}'.",
-            )
+    # 2. Validate deadline if modified
+    if "deadline" in update_data and update_data["deadline"] is not None:
+        validate_deadline_not_past(update_data["deadline"])
+
+    # 3. Assignee changes validation
+    if "assignee_id" in update_data:
         new_assignee_id = update_data["assignee_id"]
-        if new_assignee_id is not None:
+        validate_assignee_change(task, new_assignee_id)
+
+        if new_assignee_id is not None and new_assignee_id != task.assignee_id:
             await ensure_user_exists(session, new_assignee_id)
             await check_active_task_limit(session, new_assignee_id, exclude_task_id=task.id)
 
-    # Apply updates
     for field, value in update_data.items():
         setattr(task, field, value)
 
+    await session.commit()
+    await session.refresh(task)
+    return task
+
+
+@router.patch("/{task_id}/status", response_model=TaskRead)
+async def update_task_status(
+    task_id: int,
+    status_in: TaskStatusUpdate,
+    session: AsyncSession = Depends(get_async_session),
+    _: User = Depends(get_current_user),
+) -> Task:
+    """Transition task status according to strict transition rules."""
+    stmt = select(Task).where(Task.id == task_id)
+    result = await session.execute(stmt)
+    task = result.scalar_one_or_none()
+
+    if not task:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Task with ID {task_id} not found.",
+        )
+
+    validate_status_transition(task, status_in.status)
+
+    task.status = status_in.status
     await session.commit()
     await session.refresh(task)
     return task
@@ -128,7 +157,7 @@ async def delete_task(
     session: AsyncSession = Depends(get_async_session),
     _: User = Depends(get_current_user),
 ) -> None:
-    """Delete a task if not currently in progress or review."""
+    """Delete task with status restrictions."""
     stmt = select(Task).where(Task.id == task_id)
     result = await session.execute(stmt)
     task = result.scalar_one_or_none()
@@ -139,42 +168,8 @@ async def delete_task(
             detail=f"Task with ID {task_id} not found.",
         )
 
-    # Rule: Cannot delete if In Progress or Review
-    if task.status in {TaskStatus.IN_PROGRESS, TaskStatus.REVIEW}:
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail=(
-                f"Cannot delete a task in '{task.status.value}' status. "
-                "Move it to 'Cancelled' or 'Done' first."
-            ),
-        )
+    # In Progress and Review cannot be deleted
+    validate_task_deletable(task)
 
     await session.delete(task)
     await session.commit()
-
-
-@router.patch("/{task_id}/status", response_model=TaskRead)
-async def update_task_status(
-    task_id: int,
-    status_in: TaskStatusUpdate,
-    session: AsyncSession = Depends(get_async_session),
-    _: User = Depends(get_current_user),
-) -> Task:
-    """Transition task status with state machine constraints and business rules."""
-    stmt = select(Task).where(Task.id == task_id)
-    result = await session.execute(stmt)
-    task = result.scalar_one_or_none()
-
-    if not task:
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail=f"Task with ID {task_id} not found.",
-        )
-
-    # Validate business rules and transition order
-    validate_status_transition(task, status_in.status)
-
-    task.status = status_in.status
-    await session.commit()
-    await session.refresh(task)
-    return task
