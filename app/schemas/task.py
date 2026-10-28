@@ -62,3 +62,10 @@ class TaskRead(BaseModel):
     assignee: Optional[UserRead]
 
     model_config = ConfigDict(from_attributes=True)
+
+
+class TaskStatusUpdate(BaseModel):
+    status: TaskStatus = Field(
+        ...,
+        description="Target status for transition: Backlog, In Progress, Review, Done, Cancelled",
+    )

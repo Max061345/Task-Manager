@@ -7,8 +7,9 @@ from app.api.deps import get_current_user, get_async_session
 from app.models.enums import TaskStatus
 from app.models.task import Task
 from app.models.user import User
-from app.schemas.task import TaskCreate, TaskRead, TaskUpdate
-from app.services.task_service import check_active_task_limit, ensure_user_exists
+from app.schemas.task import TaskCreate, TaskRead, TaskUpdate, TaskStatusUpdate
+from app.services.task_service import check_active_task_limit, ensure_user_exists, validate_status_transition
+
 
 router = APIRouter(prefix="/tasks", tags=["Tasks"])
 
@@ -150,3 +151,30 @@ async def delete_task(
 
     await session.delete(task)
     await session.commit()
+
+
+@router.patch("/{task_id}/status", response_model=TaskRead)
+async def update_task_status(
+    task_id: int,
+    status_in: TaskStatusUpdate,
+    session: AsyncSession = Depends(get_async_session),
+    _: User = Depends(get_current_user),
+) -> Task:
+    """Transition task status with state machine constraints and business rules."""
+    stmt = select(Task).where(Task.id == task_id)
+    result = await session.execute(stmt)
+    task = result.scalar_one_or_none()
+
+    if not task:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail=f"Task with ID {task_id} not found.",
+        )
+
+    # Validate business rules and transition order
+    validate_status_transition(task, status_in.status)
+
+    task.status = status_in.status
+    await session.commit()
+    await session.refresh(task)
+    return task
