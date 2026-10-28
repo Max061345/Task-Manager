@@ -1,0 +1,10 @@
+[project]
+name = "to-do-fastapi"
+version = "0.1.0"
+requires-python = ">=3.14"
+dependencies = [
+    "fastapi[standard]>=0.162.0",
+    "jwt>=1.4.0",
+    "passlib>=1.7.4",
+    "sqlalchemy>=2.1.6",
+]
