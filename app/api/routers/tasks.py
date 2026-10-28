@@ -1,13 +1,23 @@
-from typing import List
+from datetime import datetime
+import math
+from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from sqlalchemy import select
+from sqlalchemy import case, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.api.deps import get_current_user, get_async_session
-from app.models.enums import TaskStatus
+from app.models.enums import TaskPriority, TaskStatus
 from app.models.task import Task
 from app.models.user import User
-from app.schemas.task import TaskCreate, TaskRead, TaskStatusUpdate, TaskUpdate
+from app.schemas.task import (
+    PaginatedTasksResponse,
+    SortOrder,
+    TaskCreate,
+    TaskRead,
+    TaskSortField,
+    TaskStatusUpdate,
+    TaskUpdate,
+)
 from app.services.task_service import (
     check_active_task_limit,
     ensure_user_exists,
@@ -19,6 +29,15 @@ from app.services.task_service import (
 )
 
 router = APIRouter(prefix="/tasks", tags=["Tasks"])
+
+
+# Priority weight mapping: High (1) -> Medium (2) -> Low (3)
+PRIORITY_WEIGHT_ASC = case(
+    (Task.priority == TaskPriority.HIGH, 1),
+    (Task.priority == TaskPriority.MEDIUM, 2),
+    (Task.priority == TaskPriority.LOW, 3),
+    else_=4,
+)
 
 
 @router.post("", response_model=TaskRead, status_code=status.HTTP_201_CREATED)
@@ -49,17 +68,117 @@ async def create_task(
     return new_task
 
 
-@router.get("", response_model=List[TaskRead])
+@router.get("", response_model=PaginatedTasksResponse)
 async def get_tasks(
-    skip: int = Query(0, ge=0, description="Offset for pagination"),
-    limit: int = Query(20, ge=1, le=100, description="Limit for pagination"),
+    # Search parameter
+    q: Optional[str] = Query(
+        None,
+        description="Search tasks by substring in title or description (case-insensitive)",
+    ),
+    # Filter parameters
+    status_filter: Optional[TaskStatus] = Query(
+        None, alias="status", description="Filter by task status"
+    ),
+    priority_filter: Optional[TaskPriority] = Query(
+        None, alias="priority", description="Filter by task priority"
+    ),
+    assignee_id: Optional[int] = Query(
+        None, description="Filter by assigned user ID"
+    ),
+    deadline_before: Optional[datetime] = Query(
+        None, description="Filter tasks with deadline on or before this datetime"
+    ),
+    deadline_after: Optional[datetime] = Query(
+        None, description="Filter tasks with deadline on or after this datetime"
+    ),
+    # Sorting parameters
+    sort_by: Optional[TaskSortField] = Query(
+        None,
+        description="Sort field: created_at, deadline, priority. Default: priority then deadline",
+    ),
+    order: SortOrder = Query(
+        SortOrder.ASC,
+        description="Sort order: asc or desc",
+    ),
+    # Pagination parameters
+    page: int = Query(1, ge=1, description="Page number (1-based)"),
+    limit: int = Query(20, ge=1, le=100, description="Items per page"),
     session: AsyncSession = Depends(get_async_session),
     _: User = Depends(get_current_user),
-) -> List[Task]:
-    """Retrieve list of tasks with pagination."""
-    stmt = select(Task).offset(skip).limit(limit)
-    result = await session.execute(stmt)
-    return list(result.scalars().all())
+) -> PaginatedTasksResponse:
+    """Retrieve tasks with multi-field search, filtering, custom/default sorting, and pagination."""
+    query = select(Task)
+    count_query = select(func.count()).select_from(Task)
+
+    # 1. Search filter: title or description contains q
+    if q:
+        search_pattern = f"%{q}%"
+        search_condition = or_(
+            Task.title.ilike(search_pattern),
+            Task.description.ilike(search_pattern),
+        )
+        query = query.where(search_condition)
+        count_query = count_query.where(search_condition)
+
+    # 2. Filters
+    if status_filter is not None:
+        query = query.where(Task.status == status_filter)
+        count_query = count_query.where(Task.status == status_filter)
+
+    if priority_filter is not None:
+        query = query.where(Task.priority == priority_filter)
+        count_query = count_query.where(Task.priority == priority_filter)
+
+    if assignee_id is not None:
+        query = query.where(Task.assignee_id == assignee_id)
+        count_query = count_query.where(Task.assignee_id == assignee_id)
+
+    if deadline_before is not None:
+        query = query.where(Task.deadline <= deadline_before)
+        count_query = count_query.where(Task.deadline <= deadline_before)
+
+    if deadline_after is not None:
+        query = query.where(Task.deadline >= deadline_after)
+        count_query = count_query.where(Task.deadline >= deadline_after)
+
+    # 3. Sorting logic
+    if sort_by is None:
+        # Default requirement: Priority (High -> Medium -> Low), then nearest deadline
+        query = query.order_by(PRIORITY_WEIGHT_ASC.asc(), Task.deadline.asc())
+    elif sort_by == TaskSortField.PRIORITY:
+        if order == SortOrder.ASC:
+            # ASC for priority means High -> Medium -> Low
+            query = query.order_by(PRIORITY_WEIGHT_ASC.asc(), Task.deadline.asc())
+        else:
+            # DESC for priority means Low -> Medium -> High
+            query = query.order_by(PRIORITY_WEIGHT_ASC.desc(), Task.deadline.asc())
+    elif sort_by == TaskSortField.DEADLINE:
+        deadline_col = Task.deadline.desc() if order == SortOrder.DESC else Task.deadline.asc()
+        query = query.order_by(deadline_col)
+    elif sort_by == TaskSortField.CREATED_AT:
+        created_col = Task.created_at.desc() if order == SortOrder.DESC else Task.created_at.asc()
+        query = query.order_by(created_col)
+
+    # 4. Total count calculation
+    total_result = await session.execute(count_query)
+    total_items = total_result.scalar_one()
+
+    # 5. Pagination offset & limit
+    offset = (page - 1) * limit
+    paginated_query = query.offset(offset).limit(limit)
+
+    tasks_result = await session.execute(paginated_query)
+    tasks = list(tasks_result.scalars().all())
+
+    total_pages = math.ceil(total_items / limit) if total_items > 0 else 1
+
+    return PaginatedTasksResponse(
+        items=tasks,
+        total=total_items,
+        page=page,
+        limit=limit,
+        total_pages=total_pages,
+    )
 
 
 @router.get("/{task_id}", response_model=TaskRead)
@@ -168,7 +287,6 @@ async def delete_task(
             detail=f"Task with ID {task_id} not found.",
         )
 
-    # In Progress and Review cannot be deleted
     validate_task_deletable(task)
 
     await session.delete(task)

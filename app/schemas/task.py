@@ -1,6 +1,7 @@
 from datetime import datetime, timezone
-from typing import Optional
+from typing import Optional, List
 from pydantic import BaseModel, ConfigDict, Field, field_validator
+import enum
 
 from app.models.enums import TaskPriority, TaskStatus
 from app.schemas.user import UserRead
@@ -69,3 +70,24 @@ class TaskStatusUpdate(BaseModel):
         ...,
         description="Target status for transition: Backlog, In Progress, Review, Done, Cancelled",
     )
+
+
+class TaskSortField(str, enum.Enum):
+    CREATED_AT = "created_at"
+    DEADLINE = "deadline"
+    PRIORITY = "priority"
+
+
+class SortOrder(str, enum.Enum):
+    ASC = "asc"
+    DESC = "desc"
+
+
+class PaginatedTasksResponse(BaseModel):
+    items: List[TaskRead]
+    total: int = Field(..., description="Total count of matching tasks")
+    page: int = Field(..., description="Current page number")
+    limit: int = Field(..., description="Number of items per page")
+    total_pages: int = Field(..., description="Total number of pages")
+
+    model_config = ConfigDict(from_attributes=True)
