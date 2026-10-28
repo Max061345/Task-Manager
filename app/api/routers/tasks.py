@@ -1,6 +1,6 @@
-from datetime import datetime
+from datetime import datetime, timezone
 import math
-from typing import Optional
+from typing import List, Optional
 from fastapi import APIRouter, Depends, HTTPException, Query, status
 from sqlalchemy import case, func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -9,6 +9,7 @@ from app.api.deps import get_current_user, get_async_session
 from app.models.enums import TaskPriority, TaskStatus
 from app.models.task import Task
 from app.models.user import User
+from app.schemas.stats import TaskStatisticsResponse
 from app.schemas.task import (
     PaginatedTasksResponse,
     SortOrder,
@@ -19,6 +20,8 @@ from app.schemas.task import (
     TaskUpdate,
 )
 from app.services.task_service import (
+    ACTIVE_STATUSES,
+    TERMINAL_STATUSES,
     check_active_task_limit,
     ensure_user_exists,
     validate_assignee_change,
@@ -29,7 +32,6 @@ from app.services.task_service import (
 )
 
 router = APIRouter(prefix="/tasks", tags=["Tasks"])
-
 
 # Priority weight mapping: High (1) -> Medium (2) -> Low (3)
 PRIORITY_WEIGHT_ASC = case(
@@ -70,12 +72,10 @@ async def create_task(
 
 @router.get("", response_model=PaginatedTasksResponse)
 async def get_tasks(
-    # Search parameter
     q: Optional[str] = Query(
         None,
         description="Search tasks by substring in title or description (case-insensitive)",
     ),
-    # Filter parameters
     status_filter: Optional[TaskStatus] = Query(
         None, alias="status", description="Filter by task status"
     ),
@@ -91,7 +91,6 @@ async def get_tasks(
     deadline_after: Optional[datetime] = Query(
         None, description="Filter tasks with deadline on or after this datetime"
     ),
-    # Sorting parameters
     sort_by: Optional[TaskSortField] = Query(
         None,
         description="Sort field: created_at, deadline, priority. Default: priority then deadline",
@@ -100,7 +99,6 @@ async def get_tasks(
         SortOrder.ASC,
         description="Sort order: asc or desc",
     ),
-    # Pagination parameters
     page: int = Query(1, ge=1, description="Page number (1-based)"),
     limit: int = Query(20, ge=1, le=100, description="Items per page"),
     session: AsyncSession = Depends(get_async_session),
@@ -110,7 +108,6 @@ async def get_tasks(
     query = select(Task)
     count_query = select(func.count()).select_from(Task)
 
-    # 1. Search filter: title or description contains q
     if q:
         search_pattern = f"%{q}%"
         search_condition = or_(
@@ -120,7 +117,6 @@ async def get_tasks(
         query = query.where(search_condition)
         count_query = count_query.where(search_condition)
 
-    # 2. Filters
     if status_filter is not None:
         query = query.where(Task.status == status_filter)
         count_query = count_query.where(Task.status == status_filter)
@@ -141,16 +137,12 @@ async def get_tasks(
         query = query.where(Task.deadline >= deadline_after)
         count_query = count_query.where(Task.deadline >= deadline_after)
 
-    # 3. Sorting logic
     if sort_by is None:
-        # Default requirement: Priority (High -> Medium -> Low), then nearest deadline
         query = query.order_by(PRIORITY_WEIGHT_ASC.asc(), Task.deadline.asc())
     elif sort_by == TaskSortField.PRIORITY:
         if order == SortOrder.ASC:
-            # ASC for priority means High -> Medium -> Low
             query = query.order_by(PRIORITY_WEIGHT_ASC.asc(), Task.deadline.asc())
         else:
-            # DESC for priority means Low -> Medium -> High
             query = query.order_by(PRIORITY_WEIGHT_ASC.desc(), Task.deadline.asc())
     elif sort_by == TaskSortField.DEADLINE:
         deadline_col = Task.deadline.desc() if order == SortOrder.DESC else Task.deadline.asc()
@@ -159,11 +151,9 @@ async def get_tasks(
         created_col = Task.created_at.desc() if order == SortOrder.DESC else Task.created_at.asc()
         query = query.order_by(created_col)
 
-    # 4. Total count calculation
     total_result = await session.execute(count_query)
     total_items = total_result.scalar_one()
 
-    # 5. Pagination offset & limit
     offset = (page - 1) * limit
     paginated_query = query.offset(offset).limit(limit)
 
@@ -178,6 +168,70 @@ async def get_tasks(
         page=page,
         limit=limit,
         total_pages=total_pages,
+    )
+
+
+@router.get("/overdue", response_model=List[TaskRead])
+async def get_overdue_tasks(
+    session: AsyncSession = Depends(get_async_session),
+    _: User = Depends(get_current_user),
+) -> List[Task]:
+    """Retrieve all tasks whose deadline has expired and are not Done or Cancelled."""
+    now_utc = datetime.now(timezone.utc)
+    stmt = (
+        select(Task)
+        .where(
+            Task.deadline < now_utc,
+            Task.status.not_in(TERMINAL_STATUSES),
+        )
+        .order_by(Task.deadline.asc())
+    )
+    result = await session.execute(stmt)
+    return list(result.scalars().all())
+
+
+@router.get("/statistics", response_model=TaskStatisticsResponse)
+async def get_task_statistics(
+    session: AsyncSession = Depends(get_async_session),
+    _: User = Depends(get_current_user),
+) -> TaskStatisticsResponse:
+    """Retrieve aggregated task metrics: total, by status, by priority, overdue, and active."""
+    now_utc = datetime.now(timezone.utc)
+
+    # 1. Total tasks
+    total_count = await session.scalar(select(func.count(Task.id))) or 0
+
+    # 2. Tasks grouped by status
+    status_counts: dict[TaskStatus, int] = {st: 0 for st in TaskStatus}
+    status_query = select(Task.status, func.count(Task.id)).group_by(Task.status)
+    status_result = await session.execute(status_query)
+    for st, count in status_result.all():
+        status_counts[st] = count
+
+    # 3. Tasks grouped by priority
+    priority_counts: dict[TaskPriority, int] = {pr: 0 for pr in TaskPriority}
+    priority_query = select(Task.priority, func.count(Task.id)).group_by(Task.priority)
+    priority_result = await session.execute(priority_query)
+    for pr, count in priority_result.all():
+        priority_counts[pr] = count
+
+    # 4. Overdue tasks (expired deadline, status not terminal)
+    overdue_query = select(func.count(Task.id)).where(
+        Task.deadline < now_utc,
+        Task.status.not_in(TERMINAL_STATUSES),
+    )
+    overdue_count = await session.scalar(overdue_query) or 0
+
+    # 5. Active tasks (Backlog, In Progress, Review)
+    active_query = select(func.count(Task.id)).where(Task.status.in_(ACTIVE_STATUSES))
+    active_count = await session.scalar(active_query) or 0
+
+    return TaskStatisticsResponse(
+        total_tasks=total_count,
+        tasks_by_status=status_counts,
+        tasks_by_priority=priority_counts,
+        overdue_tasks=overdue_count,
+        active_tasks=active_count,
     )
 
 
@@ -218,16 +272,13 @@ async def update_task(
             detail=f"Task with ID {task_id} not found.",
         )
 
-    # 1. Tasks in Done and Cancelled status cannot be edited
     validate_task_editable(task)
 
     update_data = task_update.model_dump(exclude_unset=True)
 
-    # 2. Validate deadline if modified
     if "deadline" in update_data and update_data["deadline"] is not None:
         validate_deadline_not_past(update_data["deadline"])
 
-    # 3. Assignee changes validation
     if "assignee_id" in update_data:
         new_assignee_id = update_data["assignee_id"]
         validate_assignee_change(task, new_assignee_id)
